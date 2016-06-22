@@ -54,29 +54,53 @@ After you are done, do a 'ifdown --exclude=lo -a && sudo ifup --exclude=lo -a'.
 ###############################################################################################################"
 
 # making a unique token for this install
-	token=`cat /dev/urandom | head -c2048 | md5sum | cut -d' ' -f1`
+token=`openssl rand -hex 10`
 
 # grab our IP 
 read -p "Enter the device name for this rig's management NIC (eth0, etc.) : " rignic
 rigip=$(/sbin/ifconfig $rignic| sed -n 's/.*inet *addr:\([0-9\.]*\).*/\1/p')
 
-# Grab our controller's name
+read -p "Enter the device name for this rig's Data Plane NIC (eth0, etc.) : " datanic
+
+# Grab our $ctrl_name's name
 read -p "Enter the name for this rig (controller, controller-01, etc.) : " ctrl_name
 
 # Give your password
 read -p "Please enter a password for MySQL : " password
 
 # Admin email
-read -p "Please enter an administrative email address : " email
+# read -p "Please enter an administrative email address : " email
 
-# Get external IP range	
-read -p "Please enter an IP range on your local network for external access (example "192.168.1.128/26" will desigante 192.168.1.129-.190) :" extip
+# Get external IP range
+# read -p "Please enter an IP range on your local network for external access (example "192.168.1.128/26" will desigante 192.168.1.129-.190) :" extip
 
-# Upgrade your rig
-apt-get update -y && apt-get upgrade -y && apt-get dist-upgrade -y
+#   backup source.list 
+#   add new sources
+mv /etc/apt/sources.list /etc/apt/sources.list.bak
+echo "deb http://ftp.tku.edu.tw/ubuntu/ trusty main restricted universe multiverse
+deb http://ftp.tku.edu.tw/ubuntu/ trusty-security main restricted universe multiverse
+deb http://ftp.tku.edu.tw/ubuntu/ trusty-updates main restricted universe multiverse
+deb http://ftp.tku.edu.tw/ubuntu/ trusty-proposed main restricted universe multiverse
+deb http://ftp.tku.edu.tw/ubuntu/ trusty-backports main restricted universe multiverse
+" >> /etc/apt/sources.list
+
+sudo apt-key adv --keyserver keyserver.ubuntu.com --recv-keys 5EDB1B62EC4926EA
+sudo apt-get install -y software-properties-common
+#   add cloud sources liberty
+sudo add-apt-repository cloud-archive:liberty
+#   upgrade to the newest
+sudo apt-get update && apt-get -y dist-upgrade
+
+################################################################################
+##                                    NTP                                     ##
+################################################################################
 
 # Install Time Server
 apt-get install -y ntp
+
+################################################################################
+##                                    DATABASE                                ##
+################################################################################
 
 # Install MySQL
 echo mysql-server-5.5 mysql-server/root_password password $password | debconf-set-selections
@@ -84,17 +108,10 @@ echo mysql-server-5.5 mysql-server/root_password_again password $password | debc
 apt-get install -y mysql-server python-mysqldb
 
 # make mysql listen on 0.0.0.0
-# sed -i "/^bind-address.*$/s/^.*$/bind-address = $rigip/" /etc/mysql/my.cnf
 MY_CNF=/etc/mysql/my.cnf
-iniset $MY_CNF mysqld bind-address $rigip
+iniset $MY_CNF mysqld bind-address 0.0.0.0
 
 # setup mysql to support utf8 and innodb
-# sed -i "/\[mysqld\]/a default-storage-engine = innodb\\
-# innodb_file_per_table\\
-# collation-server = utf8_general_ci\\
-# init-connect = 'SET NAMES utf8'\\
-# character-set-server = utf8\\
-# " /etc/mysql/my.cnf
 iniset $MY_CNF mysqld default-storage-engine innodb
 iniset $MY_CNF mysqld innodb_file_per_table
 iniset $MY_CNF mysqld collation-server utf8_general_ci
@@ -102,7 +119,7 @@ iniset $MY_CNF mysqld init-connect 'SET NAMES utf8'
 iniset $MY_CNF mysqld character-set-server utf8
 
 MYSQLD_OPENSTACK=/etc/mysql/conf.d/mysqld_openstack.cnf
-iniset $MYSQLD_OPENSTACK mysqld bind-address 172.18.118.10
+iniset $MYSQLD_OPENSTACK mysqld bind-address 0.0.0.0
 iniset $MYSQLD_OPENSTACK mysqld default-storage-engine innodb
 iniset $MYSQLD_OPENSTACK mysqld innodb_file_per_table
 iniset $MYSQLD_OPENSTACK mysqld collation-server utf8_general_ci
@@ -115,191 +132,141 @@ service mysql restart
 # wait for restart
 sleep 4 
 
-# Delete the anonymous users that are created when the database is first started:
-aptitude -y install expect
- 
-SECURE_MYSQL=$(expect -c "
- 
-set timeout 10
-spawn mysql_secure_installation
- 
-expect \"Enter current password for root (enter for none):\"
-send \"$password\r\"
- 
-expect \"Change the root password?\"
-send \"n\r\"
- 
-expect \"Remove anonymous users?\"
-send \"y\r\"
- 
-expect \"Disallow root login remotely?\"
-send \"y\r\"
- 
-expect \"Remove test database and access to it?\"
-send \"y\r\"
- 
-expect \"Reload privilege tables now?\"
-send \"y\r\"
- 
-expect eof
-")
- 
-echo "$SECURE_MYSQL"
- 
-aptitude -y purge expect
-
+################################################################################
+##                                    RABBITMQ                                ##
+################################################################################
 # Install RabbitMQ (Message Queue):
 apt-get install -y rabbitmq-server
 
 #Replace RABBIT_PASS with a suitable password.
-rabbitmqctl change_password guest $password
+rabbitmqctl add_user openstack admin
+rabbitmqctl set_permissions openstack ".*" ".*" ".*"
+
+################################################################################
+##                                    OPENSTACK CLIENT                        ##
+################################################################################
+apt-get install -y python-openstackclient
 
 
 ################################################################################
 ##                                    KEYSTONE                                ##
 ################################################################################
 
-
-# Install keystone packages:
-apt-get install -y keystone
-
-# edit keystone conf file to use templates and mysql
-if [ -f /etc/keystone/keystone.conf.orig ]; then
-  echo "Original backup of keystone.conf file exists. Your current config will be modified by this script."
-  cp /etc/keystone/keystone.conf.orig /etc/keystone/keystone.conf
-else
-  cp /etc/keystone/keystone.conf /etc/keystone/keystone.conf.orig
-fi
-
-# sed -e "
-# /^connection =.*$/s/^.*$/connection = mysql:\/\/keystone:$password@$ctrl_name\/keystone/
-# " -i /etc/keystone/keystone.conf
-KEYSTONE_CNF=/etc/keystone/keystone.conf
-iniset $KEYSTONE_CNF database connection "mysql+pymysql://keystone:$password@$ctrl_name/keystone"
-
-# Remove Keystone SQLite database:
-rm /var/lib/keystone/keystone.db
-
-# Create a MySQL database for keystone:
+# 创建数据库
 mysql -u root -p"$password"<<EOF
 CREATE DATABASE keystone;
-GRANT ALL PRIVILEGES ON keystone.* TO 'keystone'@'localhost' IDENTIFIED BY '$password';
-GRANT ALL PRIVILEGES ON keystone.* TO 'keystone'@'%' IDENTIFIED BY '$password';
+GRANT ALL PRIVILEGES ON keystone.* TO 'keystone'@'localhost' \
+  IDENTIFIED BY 'admin';
+GRANT ALL PRIVILEGES ON keystone.* TO 'keystone'@'%' \
+  IDENTIFIED BY 'admin';
 EOF
 
-keystone-manage db_sync
-sleep 5
+apt-get install -y keystone
 
-# sed -e "
-# /^#admin_token=.*$/s/^.*$/admin_token = $token/
-# /\[DEFAULT\]/a log_dir=/var/log/keystone/
-# " -i /etc/keystone/keystone.conf
-iniset $KEYSTONE_CNF DEFAULT admin_token   $token
-iniset $KEYSTONE_CNF DEFAULT log_dir /var/log/keystone/
-iniset $KEYSTONE_CNF memcache servers localhost:11211
-iniset $KEYSTONE_CNF token provider uuid
-iniset $KEYSTONE_CNF token driver memcache
-iniset $KEYSTONE_CNF revoke driver sql
+# edit /etc/keystone/keystone.conf
+iniset /etc/keystone/keystone.conf DEFAULT admin_token $token
+iniset /etc/keystone/keystone.conf database connection "mysql+pymysql://keystone:$password@$rigip/keystone"
 
-# Restart the identity service then synchronize the database:
+# 重启keystone:
 service keystone restart
-sleep 5
 
-# Define users, tenants, and roles:
-export OS_SERVICE_TOKEN=$token
-export OS_SERVICE_ENDPOINT=http://$ctrl_name:35357/v2.0
+# 初始化数据库
+su -s /bin/sh -c "keystone-manage db_sync" keystone
 
-# Create an administrative user
-keystone user-create --name=admin --pass=$password --email=$email
-keystone role-create --name=admin
-keystone tenant-create --name=admin --description="Admin Tenant"
-keystone user-role-add --user=admin --tenant=admin --role=admin
-keystone user-role-add --user=admin --role=_member_ --tenant=admin
+export OS_TOKEN=$token
+export OS_URL=http://$rigip:35357/v3
+export OS_IDENTITY_API_VERSION=3
 
-# Create a normal user
-keystone user-create --name=demo --pass=$password --email=$email
-keystone tenant-create --name=demo --description="Demo Tenant"
-keystone user-role-add --user=demo --role=_member_ --tenant=demo
+# 增加keystone服务条目：
+openstack service create --name keystone --description "OpenStack Identity" identity
 
-# Create a service tenant
-keystone tenant-create --name=service --description="Service Tenant"
+# 增加API endpoints：
+openstack endpoint create --region RegionOne \
+  identity public http://$rigip:5000/v2.0
+openstack endpoint create --region RegionOne \
+  identity internal http://$rigip:5000/v2.0
+openstack endpoint create --region RegionOne \
+  identity admin http://$rigip:35357/v2.0
 
-# Define services and API endpoints:
-keystone service-create --name=keystone --type=identity --description="OpenStack Identity"
+# 创建一个admin project和一个admin角色以及用户：
+openstack project create --domain default --description "Admin Project" admin
+openstack user create --domain default --password $password admin
+openstack role create admin
+openstack role add --project admin --user admin admin
 
-keystone endpoint-create \
---service-id=$(keystone service-list | awk '/ identity / {print $2}') \
---publicurl=http://$ctrl_name:5000/v2.0 \
---internalurl=http://$ctrl_name:5000/v2.0 \
---adminurl=http://$ctrl_name:35357/v2.0
+# 创建一个service project用来存放各个服务专属的用户：
+openstack project create --domain default --description "Service Project" service
 
-# Test Keystone
-#clear the values in the OS_SERVICE_TOKEN and OS_SERVICE_ENDPOINT environment variables
- unset OS_SERVICE_TOKEN OS_SERVICE_ENDPOINT
+# 创建一个demo project和一个user角色以及一个普通用户demo：
+openstack project create --domain default --description "Demo Project" demo
+openstack user create --domain default --password $password demo
+openstack role create user
+openstack role add --project demo --user demo user
 
-#Request a authentication token
-keystone --os-username=admin --os-password=$password --os-auth-url=http://$ctrl_name:35357/v2.0 token-get
+# unset var
+unset OS_TOKEN OS_URL OS_IDENTITY_API_VERSION
 
-keystone --os-username=admin --os-password=$password \
-  --os-tenant-name=admin --os-auth-url=http://$ctrl_name:35357/v2.0 \
-  token-get
+# 用新创建的admin用户去获取一个令牌：
+openstack --os-auth-url http://$rigip:35357/v3 \
+  --os-project-domain-id default --os-user-domain-id default \
+  --os-project-name admin --os-username admin --os-auth-type password \
+  token issue
 
-# Create a simple credential file:
-cat > /root/admin-openrc.sh <<EOF
-export OS_USERNAME=admin
-export OS_PASSWORD=$password
+#用新创建的demo用户去获取一个令牌：
+openstack --os-auth-url http://$rigip:5000/v3 \
+  --os-project-domain-id default --os-user-domain-id default \
+  --os-project-name demo --os-username demo --os-auth-type password \
+  token issue
+
+cat > ./admin-openrc.sh <<EOF
+export OS_PROJECT_DOMAIN_ID=default
+export OS_USER_DOMAIN_ID=default
+export OS_PROJECT_NAME=admin
 export OS_TENANT_NAME=admin
-export OS_AUTH_URL=http://$ctrl_name:35357/v2.0
+export OS_USERNAME=admin
+export OS_PASSWORD=admin
+export OS_AUTH_URL=http://$rigip:35357/v3
+export OS_IDENTITY_API_VERSION=3
 EOF
 
-# Source this file to read in the environment variables:
-source /root/admin-openrc.sh
-
-# Verify that your admin-openrc.sh file is configured correctly. 
-# Run the same command without the --os-* arguments:
-keystone token-get
-
-# Verify that your admin account has authorization to perform administrative commands:
-keystone user-list
-keystone user-role-list --user admin --tenant admin
-
-(crontab -l -u keystone 2>&1 | grep -q token_flush) || \
-echo '@hourly /usr/bin/keystone-manage token_flush >/var/log/keystone/keystone-tokenflush.log 2>&1' >> /var/spool/cron/crontabs/keystone
+cat > ./demo-openrc.sh <<EOF
+export OS_PROJECT_DOMAIN_ID=default
+export OS_USER_DOMAIN_ID=default
+export OS_PROJECT_NAME=demo
+export OS_TENANT_NAME=demo
+export OS_USERNAME=demo
+export OS_PASSWORD=demo
+export OS_AUTH_URL=http://$rigip:5000/v3
+export OS_IDENTITY_API_VERSION=3
+EOF
 
 ################################################################################
-##                                    GLANCE                                  ##
+##                                    glance                                ##
 ################################################################################
 
-# Install Glance packages:
+mysql -u root -p"$password"<<EOF
+CREATE DATABASE glance;
+GRANT ALL PRIVILEGES ON glance.* TO 'glance'@'localhost' \
+  IDENTIFIED BY 'admin';
+GRANT ALL PRIVILEGES ON glance.* TO 'glance'@'%' \
+  IDENTIFIED BY 'admin';
+EOF
+
+source admin-openrc.sh
+openstack user create --domain default --password $password glance
+openstack role add --project service --user glance admin
+openstack service create --name glance --description "OpenStack Image service" image
+openstack endpoint create --region RegionOne image public http://$rigip:9292
+openstack endpoint create --region RegionOne image internal http://$rigip:9292
+openstack endpoint create --region RegionOne image admin http://$rigip:9292
+
 apt-get install -y glance python-glanceclient
 
-
-
-# edit glance api conf files 
-if [ -f /etc/glance/glance-api.conf.orig ]
-then
-   echo "#################################################################################################"
-   echo;
-   echo "Notice: I'm not changing config files again.  If you want to edit, they are in /etc/glance/"
-   echo; 
-   echo "#################################################################################################"
-else 
-   # copy to backups before editing
-   cp /etc/glance/glance-api.conf /etc/glance/glance-api.conf.orig
-   cp /etc/glance/glance-registry.conf /etc/glance/glance-registry.conf.orig
-
-# Edit /etc/glance/glance-api.conf and /etc/glance/glance-registry.conf 
-# and edit the [database] section of each file:
-# sed -e "
-# /^sqlite_db =.*$/s/^.*$/connection = mysql:\/\/glance:$password@$ctrl_name\/glance/
-# " -i /etc/glance/glance-api.conf
-# GLANCE_API=/etc/glance/glance-api.conf
-# iniset $GLANCE_API database connection "mysql+pymysql://glance:$password@$ctrl_name/glance/"
-
+# edit /etc/glance/glance-api.conf
 GLANCE_API=/etc/glance/glance-api.conf
-iniset $GLANCE_API database connection"mysql+pymysql://glance:$password@$ctrl_name/glance"
-iniset $GLANCE_API keystone_authtoken auth_uri http://controller:5000
-iniset $GLANCE_API keystone_authtoken auth_url http://controller:35357
+iniset $GLANCE_API database connection "mysql+pymysql://glance:$password@$rigip/glance"
+iniset $GLANCE_API keystone_authtoken auth_uri http://$rigip:5000
+iniset $GLANCE_API keystone_authtoken auth_url http://$rigip:35357
 iniset $GLANCE_API keystone_authtoken auth_plugin password
 iniset $GLANCE_API keystone_authtoken project_domain_id default
 iniset $GLANCE_API keystone_authtoken user_domain_id default
@@ -311,13 +278,11 @@ iniset $GLANCE_API glance_store default_store file
 iniset $GLANCE_API glance_store filesystem_store_datadir /var/lib/glance/images/
 iniset $GLANCE_API notification_driver noop
 
-# sed -e "
-# /^sqlite_db =.*$/s/^.*$/connection = mysql:\/\/glance:$password@$ctrl_name\/glance/
-# " -i /etc/glance/glance-registry.conf
+# edit /etc/glance/glance-registry.conf
 GLANCE_REG=/etc/glance/glance-registry.conf
-iniset $GLANCE_REG database connection "mysql+pymysql://glance:$password@$ctrl_name/glance"
-iniset $GLANCE_REG keystone_authtoken auth_uri http://controller:5000
-iniset $GLANCE_REG keystone_authtoken auth_url http://controller:35357
+iniset $GLANCE_REG database connection "mysql+pymysql://glance:$password@$rigip/glance"
+iniset $GLANCE_REG keystone_authtoken auth_uri http://$rigip:5000
+iniset $GLANCE_REG keystone_authtoken auth_url http://$rigip:35357
 iniset $GLANCE_REG keystone_authtoken auth_plugin password
 iniset $GLANCE_REG keystone_authtoken project_domain_id default
 iniset $GLANCE_REG keystone_authtoken user_domain_id default
@@ -327,253 +292,302 @@ iniset $GLANCE_REG keystone_authtoken password $password
 iniset $GLANCE_REG paste_deploy flavor keystone
 iniset $GLANCE_REG DEFAULT notification_driver noop
 
-# Delete the glance.sqlite file created in the /var/lib/glance/ 
-# directory so that it does not get used by mistake:
-rm /var/lib/glance/glance.sqlite
+su -s /bin/sh -c "glance-manage db_sync" glance
 
-#Use the password you created to log in as root and create a glance database user:
-mysql -u root -p"$password" <<EOF
-CREATE DATABASE glance;
-GRANT ALL PRIVILEGES ON glance.* TO 'glance'@'localhost' IDENTIFIED BY '$password';
-GRANT ALL PRIVILEGES ON glance.* TO 'glance'@'%' IDENTIFIED BY '$password';
-EOF
-
-# Synchronize the glance database:
-glance-manage db_sync
-
-# Configure service user and role:
-keystone user-create --name=glance --pass=$password --email=$email
-keystone user-role-add --user=glance --tenant=service --role=admin
-
-# Edit the /etc/glance/glance-api.conf and /etc/glance/glance-registry.conf files. 
-# sed -e "
-# /keystone_authtoken/a auth_uri = http://$ctrl_name:5000
-# /^auth_host =.*$/s/^.*$/auth_host = $ctrl_name/
-# /^auth_port =.*$/s/^.*$/auth_port = 35357/
-# /^auth_protocol =.*$/s/^.*$/auth_protocol = http/
-# /^admin_tenant_name =.*$/s/^.*$/admin_tenant_name = service/
-# /^admin_user =.*$/s/^.*$/admin_user = glance/
-# /^admin_password =.*$/s/^.*$/admin_password = $password/
-# /\[paste_deploy\]/a flavor = keystone
-# " -i /etc/glance/glance-registry.conf
-
-# sed -e "
-# /^rabbit_host =.*$/s/^.*$/rabbit_host = $ctrl_name/
-# /rabbit_use_ssl = false/a rpc_backend = rabbit
-# /keystone_authtoken/a auth_uri = http://$ctrl_name:5000
-# /^auth_host =.*$/s/^.*$/auth_host = $ctrl_name/
-# /^auth_port =.*$/s/^.*$/auth_port = 35357/
-# /^auth_protocol =.*$/s/^.*$/auth_protocol = http/
-# /^admin_tenant_name =.*$/s/^.*$/admin_tenant_name = service/
-# /^admin_user =.*$/s/^.*$/admin_user = glance/
-# /^admin_password =.*$/s/^.*$/admin_password = $password/
-# /\[paste_deploy\]/a flavor = keystone
-# " -i /etc/glance/glance-api.conf
-fi
-
-# Register the service and create the endpoint:
-keystone service-create --name=glance --type=image --description="OpenStack Image Service"
-keystone endpoint-create \
---service-id=$(keystone service-list | awk '/ image / {print $2}') \
---publicurl=http://$ctrl_name:9292 \
---internalurl=http://$ctrl_name:9292 \
---adminurl=http://$ctrl_name:9292
-
-# Restart the glance-api and glance-registry services:
-service glance-api restart 
-sleep 5
 service glance-registry restart
-sleep 5
+service glance-api restart
 
-# Test Glance, upload the cirros cloud image:
-source /root/admin-openrc.sh
-glance image-create --name "cirros-0.3.2-x86_64" --is-public true \
---container-format bare --disk-format qcow2 \
---location http://cdn.download.cirros-cloud.net/0.3.2/cirros-0.3.2-x86_64-disk.img
+echo "export OS_IMAGE_API_VERSION=2" \
+  | tee -a admin-openrc.sh demo-openrc.sh
 
-glance image-create --name "Trusty 14.04" --is-public true \
---container-format bare --disk-format qcow2 \
---location https://cloud-images.ubuntu.com/trusty/current/trusty-server-cloudimg-amd64-disk1.img
+source admin-openrc.sh
 
-# List Images:
-glance image-list
+#curl -O http://download.cirros-cloud.net/0.3.4/cirros-0.3.4-x86_64-disk.img
 
+glance image-create --name "cirros" \
+  --file cirros-0.3.4-x86_64-disk.img \
+  --disk-format qcow2 --container-format bare \
+  --visibility public --progress
 
 ################################################################################
-##                                    NOVA                                    ##
+##                                    nova                                ##
 ################################################################################
 
-# Install nova packages:
-apt-get install -y nova-api nova-cert nova-conductor nova-consoleauth \
-nova-novncproxy nova-scheduler python-novaclient
-
-# Edit the /etc/nova/nova.conf:
-echo "
-[DEFAULT]
-dhcpbridge_flagfile=/etc/nova/nova.conf
-dhcpbridge=/usr/bin/nova-dhcpbridge
-logdir=/var/log/nova
-state_path=/var/lib/nova
-lock_path=/var/lock/nova
-force_dhcp_release=True
-iscsi_helper=tgtadm
-libvirt_use_virtio_for_bridges=True
-connection_type=libvirt
-root_helper=sudo nova-rootwrap /etc/nova/rootwrap.conf
-verbose=True
-ec2_private_dns_show_ip=True
-api_paste_config=/etc/nova/api-paste.ini
-volumes_path=/var/lib/nova/volumes
-enabled_apis=ec2,osapi_compute,metadata
-
-#RABBIT
-rpc_backend = rabbit
-rabbit_host = $ctrl_name
-rabbit_password = $password
-
-#VNC
-my_ip = $rigip
-vncserver_listen = $rigip
-vncserver_proxyclient_address = $rigip
-auth_strategy = keystone
-
-#NETWORKING
-network_api_class = nova.network.api.API
-security_group_api = nova
-
-[database]
-connection = mysql://nova:$password@$ctrl_name/nova
-
-[keystone_authtoken]
-auth_uri = http://$ctrl_name:5000
-auth_host = $ctrl_name
-auth_port = 35357
-auth_protocol = http
-admin_tenant_name = service
-admin_user = nova
-admin_password = $password
-" > /etc/nova/nova.conf
-
-# Remove Nova SQLite database:
-rm /var/lib/nova/nova.sqlite
-
-# Create a Mysql database for Nova:
-mysql -u root -p"$password" <<EOF
-
+mysql -u root -p"$password"<<EOF
 CREATE DATABASE nova;
-GRANT ALL PRIVILEGES ON nova.* TO 'nova'@'localhost' IDENTIFIED BY '$password';
-GRANT ALL PRIVILEGES ON nova.* TO 'nova'@'%' IDENTIFIED BY '$password';
+GRANT ALL PRIVILEGES ON nova.* TO 'nova'@'localhost' \
+  IDENTIFIED BY 'admin';
+GRANT ALL PRIVILEGES ON nova.* TO 'nova'@'%' \
+  IDENTIFIED BY 'admin';
 EOF
 
-# Synchronize your database:
-nova-manage db sync
+source admin-openrc.sh
+openstack user create --domain default --password $password nova
+openstack role add --project service --user nova admin
 
-# Configure service user and role:
-keystone user-create --name=nova --pass=$password --email=$email
-keystone user-role-add --user=nova --tenant=service --role=admin
+openstack service create --name nova --description "OpenStack Compute" compute
 
-# Register the service and create the endpoint:
-keystone service-create --name=nova --type=compute --description="OpenStack Compute"
-keystone endpoint-create \
---service-id=$(keystone service-list | awk '/ compute / {print $2}') \
---publicurl=http://$ctrl_name:8774/v2/%\(tenant_id\)s \
---internalurl=http://$ctrl_name:8774/v2/%\(tenant_id\)s \
---adminurl=http://$ctrl_name:8774/v2/%\(tenant_id\)s
+openstack endpoint create --region RegionOne compute public http://$rigip:8774/v2/%\(tenant_id\)s
+openstack endpoint create --region RegionOne compute internal http://$rigip:8774/v2/%\(tenant_id\)s
+openstack endpoint create --region RegionOne compute admin http://$rigip:8774/v2/%\(tenant_id\)s
 
-# Restart nova-* services:
-service nova-api restart
-service nova-cert restart
-service nova-conductor restart
+apt-get install -y nova-api nova-conductor \
+  nova-consoleauth nova-novncproxy nova-scheduler \
+  python-novaclient sysfsutils
+
+# vi /etc/nova/nova.conf
+iniset /etc/nova/nova.conf database connection mysql+pymysql://nova:$password@$rigip/nova
+iniset /etc/nova/nova.conf DEFAULT rpc_backend rabbit
+iniset /etc/nova/nova.conf DEFAULT auth_strategy keystone
+iniset /etc/nova/nova.conf DEFAULT my_ip $rigip
+#iniset /etc/nova/nova.conf DEFAULT network_api_class nova.network.neutronv2.api.API
+#iniset /etc/nova/nova.conf DEFAULT linuxnet_interface_driver nova.network.linux_net.NeutronLinuxBridgeInterfaceDriver
+#iniset /etc/nova/nova.conf DEFAULT firewall_driver nova.virt.firewall.NoopFirewallDriver
+iniset /etc/nova/nova.conf DEFAULT enabled_apis osapi_compute,metadata
+#iniset /etc/nova/nova.conf DEFAULT rootwrap_config /etc/nova/rootwrap.conf
+#inicomment /etc/nova/nova.conf DEFAULT security_group_api
+iniset /etc/nova/nova.conf oslo_messaging_rabbit rabbit_host $rigip
+iniset /etc/nova/nova.conf oslo_messaging_rabbit rabbit_userid openstack
+iniset /etc/nova/nova.conf oslo_messaging_rabbit rabbit_password $password
+iniset /etc/nova/nova.conf keystone_authtoken auth_uri http://$rigip:5000
+iniset /etc/nova/nova.conf keystone_authtoken auth_url http://$rigip:35357
+iniset /etc/nova/nova.conf keystone_authtoken auth_plugin password
+iniset /etc/nova/nova.conf keystone_authtoken project_domain_id default
+iniset /etc/nova/nova.conf keystone_authtoken user_domain_id default
+iniset /etc/nova/nova.conf keystone_authtoken project_name service
+iniset /etc/nova/nova.conf keystone_authtoken username nova
+iniset /etc/nova/nova.conf keystone_authtoken password $password
+iniset /etc/nova/nova.conf vnc enabled true
+iniset /etc/nova/nova.conf vnc vncserver_listen $rigip
+iniset /etc/nova/nova.conf vnc vncserver_proxyclient_address $rigip
+iniset /etc/nova/nova.conf vnc novncproxy_base_url http://$rigip:6080/vnc_auto.html
+iniset /etc/nova/nova.conf glance host $rigip
+iniset /etc/nova/nova.conf oslo_concurrency lock_path /var/lib/nova/tmp
+
+service nova-api restart 
 service nova-consoleauth restart
-service nova-novncproxy restart
 service nova-scheduler restart
+service nova-conductor restart
+service nova-novncproxy restart
 
-# Check Nova is running. The :-) icons indicate that everything is ok !:
-nova-manage service list
+# 初始化数据库
+su -s /bin/sh -c "nova-manage db sync" nova
 
-# To verify your configuration, list available images:
-source /root/admin-openrc.sh
+service nova-api restart 
+service nova-consoleauth restart
+service nova-scheduler restart
+service nova-conductor restart
+service nova-novncproxy restart
+
+source admin-openrc.sh
+
+# nova启动的服务：
+nova service-list
+
+# nova的endpoints:
+nova endpoints
+
+# 通过nova也可以查看镜像列表：
 nova image-list
 
+################################################################################
+##                                    neutron ctrl                                ##
+################################################################################
+
+mysql -u root -p"$password" <<EOF
+CREATE DATABASE neutron;
+GRANT ALL PRIVILEGES ON neutron.* TO 'neutron'@'localhost' \
+  IDENTIFIED BY 'admin';
+GRANT ALL PRIVILEGES ON neutron.* TO 'neutron'@'%' \
+  IDENTIFIED BY 'admin';
+EOF
+
+source admin-openrc.sh
+openstack user create --domain default --password $password neutron
+openstack role add --project service --user neutron admin
+openstack service create --name neutron --description "OpenStack Networking" network
+openstack endpoint create --region RegionOne network public http://$rigip:9696
+openstack endpoint create --region RegionOne network internal http://$rigip:9696
+openstack endpoint create --region RegionOne network admin http://$rigip:9696
+
+apt-get install -y neutron-server neutron-plugin-ml2 \
+  python-neutronclient conntrack
+
+# edit /etc/neutron/neutron.conf
+iniset /etc/neutron/neutron.conf database connection mysql+pymysql://neutron:$password@$rigip/neutron
+iniset /etc/neutron/neutron.conf DEFAULT core_plugin ml2
+iniset /etc/neutron/neutron.conf DEFAULT service_plugins 
+iniset /etc/neutron/neutron.conf DEFAULT rpc_backend rabbit
+iniset /etc/neutron/neutron.conf DEFAULT auth_strategy keystone
+iniset /etc/neutron/neutron.conf DEFAULT notify_nova_on_port_status_changes True
+iniset /etc/neutron/neutron.conf DEFAULT notify_nova_on_port_data_changes True
+iniset /etc/neutron/neutron.conf DEFAULT nova_url http://$rigip:8774/v2
+iniset /etc/neutron/neutron.conf oslo_messaging_rabbit rabbit_host $rigip
+iniset /etc/neutron/neutron.conf oslo_messaging_rabbit rabbit_userid openstack
+iniset /etc/neutron/neutron.conf oslo_messaging_rabbit rabbit_password $password
+iniset /etc/neutron/neutron.conf keystone_authtoken auth_uri http://$rigip:5000
+iniset /etc/neutron/neutron.conf keystone_authtoken auth_url http://$rigip:35357
+iniset /etc/neutron/neutron.conf keystone_authtoken auth_plugin password
+iniset /etc/neutron/neutron.conf keystone_authtoken project_domain_id default
+iniset /etc/neutron/neutron.conf keystone_authtoken user_domain_id default
+iniset /etc/neutron/neutron.conf keystone_authtoken project_name service
+iniset /etc/neutron/neutron.conf keystone_authtoken username neutron
+iniset /etc/neutron/neutron.conf keystone_authtoken password $password
+iniset /etc/neutron/neutron.conf nova auth_url http://$rigip:35357
+iniset /etc/neutron/neutron.conf nova auth_plugin password
+iniset /etc/neutron/neutron.conf nova project_domain_id default
+iniset /etc/neutron/neutron.conf nova user_domain_id default
+iniset /etc/neutron/neutron.conf nova region_name RegionOne
+iniset /etc/neutron/neutron.conf nova project_name service
+iniset /etc/neutron/neutron.conf nova username nova
+iniset /etc/neutron/neutron.conf nova password $password
+
+# edit /etc/neutron/plugins/ml2/ml2_conf.ini
+iniset /etc/neutron/plugins/ml2/ml2_conf.ini ml2 enable_ipset true
+iniset /etc/neutron/plugins/ml2/ml2_conf.ini ml2 extension_drivers port_security
+iniset /etc/neutron/plugins/ml2/ml2_conf.ini ml2 mechanism_drivers openvswitch
+iniset /etc/neutron/plugins/ml2/ml2_conf.ini ml2 tenant_network_types vlan
+iniset /etc/neutron/plugins/ml2/ml2_conf.ini ml2 type_drivers vlan
+iniset /etc/neutron/plugins/ml2/ml2_conf.ini ml2_type_vlan network_vlan_ranges default:3001:4000
+
+
+# edit /etc/nova/nova.conf
+iniset /etc/nova/nova.conf neutron url http://$rigip:9696
+iniset /etc/nova/nova.conf neutron auth_url http://$rigip:35357
+iniset /etc/nova/nova.conf neutron auth_plugin password
+iniset /etc/nova/nova.conf neutron project_domain_id default
+iniset /etc/nova/nova.conf neutron user_domain_id default
+iniset /etc/nova/nova.conf neutron region_name RegionOne
+iniset /etc/nova/nova.conf neutron project_name service
+iniset /etc/nova/nova.conf neutron username neutron
+iniset /etc/nova/nova.conf neutron password $password
+iniset /etc/nova/nova.conf neutron service_metadata_proxy True
+iniset /etc/nova/nova.conf neutron metadata_proxy_shared_secret $password
+
+su -s /bin/sh -c "neutron-db-manage --config-file /etc/neutron/neutron.conf \
+  --config-file /etc/neutron/plugins/ml2/ml2_conf.ini upgrade head" neutron
+
+service nova-api restart
+service neutron-server restart
+
+neutron ext-list
 
 ################################################################################
-##                                    HORIZON                                 ##
+##                                    neutron network                                ##
 ################################################################################
 
+apt-get install -y neutron-l3-agent neutron-dhcp-agent \
+  python-neutronclient conntrack neutron-plugin-openvswitch-agent \
+  openvswitch-switch neutron-metadata-agent
 
-# Install the required packages:
-apt-get install -y apache2 memcached libapache2-mod-wsgi openstack-dashboard
-sleep 5
+
+# edit /etc/neutron/neutron.conf
+iniset /etc/neutron/neutron.conf DEFAULT core_plugin ml2
+iniset /etc/neutron/neutron.conf DEFAULT service_plugins router
+iniset /etc/neutron/neutron.conf DEFAULT allow_overlapping_ips True
+iniset /etc/neutron/neutron.conf DEFAULT rpc_backend rabbit
+iniset /etc/neutron/neutron.conf DEFAULT auth_strategy keystone
+iniset /etc/neutron/neutron.conf DEFAULT notify_nova_on_port_status_changes True
+iniset /etc/neutron/neutron.conf DEFAULT notify_nova_on_port_data_changes True
+iniset /etc/neutron/neutron.conf DEFAULT nova_url http://$rigip:8774/v2
+iniset /etc/neutron/neutron.conf oslo_messaging_rabbit rabbit_host $rigip
+iniset /etc/neutron/neutron.conf oslo_messaging_rabbit rabbit_userid openstack
+iniset /etc/neutron/neutron.conf oslo_messaging_rabbit rabbit_password $password
+iniset /etc/neutron/neutron.conf keystone_authtoken auth_url http://$rigip:35357
+iniset /etc/neutron/neutron.conf keystone_authtoken auth_plugin password
+iniset /etc/neutron/neutron.conf keystone_authtoken project_domain_id default
+iniset /etc/neutron/neutron.conf keystone_authtoken user_domain_id default
+iniset /etc/neutron/neutron.conf keystone_authtoken project_name service
+iniset /etc/neutron/neutron.conf keystone_authtoken username neutron
+iniset /etc/neutron/neutron.conf keystone_authtoken password $password
+iniset /etc/neutron.neturon.conf nova auth_url http://$rigip:35357
+iniset /etc/neutron.neturon.conf nova auth_plugin password
+iniset /etc/neutron.neturon.conf nova project_domain_id default
+iniset /etc/neutron.neturon.conf nova user_domain_id default
+iniset /etc/neutron.neturon.conf nova region_name RegionOne
+iniset /etc/neutron.neturon.conf nova project_name service
+iniset /etc/neutron.neturon.conf nova username nova
+iniset /etc/neutron.neturon.conf nova password $password
+
+# vi /etc/neutron/plugins/ml2/openvswitch_agent.ini
+iniset /etc/neutron/plugins/ml2/openvswitch_agent.ini ovs integration_bridge br-int
+iniset /etc/neutron/plugins/ml2/openvswitch_agent.ini agent agent_type 'Open vSwitch agent'
+iniset /etc/neutron/plugins/ml2/openvswitch_agent.ini ovs datapath system
+iniset /etc/neutron/plugins/ml2/openvswitch_agent.ini ovs bridge_mappings default:br-ex
+
+# vi /etc/neutron/l3_agent.ini
+iniset /etc/neutron/l3_agent.ini DEFAULT interface_driver neutron.agent.linux.interface.OVSInterfaceDriver
+iniset /etc/neutron/l3_agent.ini DEFAULT external_network_bridge 
+
+touch /etc/neutron/fwaas_driver.ini
+
+# vi /etc/neutron/dhcp_agent.ini
+iniset /etc/neutron/dhcp_agent.ini DEFAULT interface_driver neutron.agent.linux.interface.OVSInterfaceDriver
+iniset /etc/neutron/dhcp_agent.ini DEFAULT dhcp_driver neutron.agent.linux.dhcp.Dnsmasq
+iniset /etc/neutron/dhcp_agent.ini DEFAULT enable_isolated_metadata True
+iniset /etc/neutron/dhcp_agent.ini DEFAULT dnsmasq_config_file /etc/neutron/dnsmasq-neutron.conf
+
+# vi /etc/neutron/dnsmasq-neutron.conf
+iniset /etc/neutron/dnsmasq-neutron.conf DEFAULT dhcp-option-force 26,1450
+
+# vi /etc/neutron/metadata_agent.ini
+iniset /etc/neutron/metadeta_agent.ini DEFAULT auth_url http://$rigip:35357
+iniset /etc/neutron/metadeta_agent.ini DEFAULT auth_region RegionOne
+iniset /etc/neutron/metadeta_agent.ini DEFAULT auth_plugin password
+iniset /etc/neutron/metadeta_agent.ini DEFAULT project_domain_id default
+iniset /etc/neutron/metadeta_agent.ini DEFAULT user_domain_id default
+iniset /etc/neutron/metadeta_agent.ini DEFAULT project_name service
+iniset /etc/neutron/metadeta_agent.ini DEFAULT username neutron
+iniset /etc/neutron/metadeta_agent.ini DEFAULT password $password
+iniset /etc/neutron/metadeta_agent.ini DEFAULT nova_metadata_ip $rigip
+iniset /etc/neutron/metadeta_agent.ini DEFAULT metadata_proxy_shared_secret $password
+
+# vi /etc/neutron/linuxbridge_agent.ini
+iniset /etc/neutron/plugins/ml2/linuxbridge_agent.ini linux_bridge physical_interface_mappings default:br-ex
+iniset /etc/neutron/plugins/ml2/linuxbridge_agent.ini vxlan enable_vxlan false
+iniset /etc/neutron/plugins/ml2/linuxbridge_agent.ini agent prevent_arp_spoofing true
+iniset /etc/neutron/plugins/ml2/linuxbridge_agent.ini securitygroup enable_security_group true
+iniset /etc/neutron/plugins/ml2/linuxbridge_agent.ini securitygroup firewall_driver neutron.agent.linux.iptables_firewall.IptablesFirewallDriver
+
+# 重启nova服务
+service nova-api restart
+service neutron-server restart
+service nova-compute restart
+service neutron-plugin-openvswitch-agent restart
+service neutron-dhcp-agent restart
+service neutron-metadata-agent restart
+service neutron-l3-agent restart
+
+# 创建业务网络网桥
+ovs-vsctl add-br br-ex
+ovs-vsctl add-port br-ex $datanic
+
+cat >> /etc/network/interfaces << EOF
+auto $datanic
+iface $datanic inet manual
+up ip link set dev $IFACE up
+down ip link set dev $IFACE down
+EOF
+
+# 重启网络服务
+service neutron-plugin-openvswitch-agent restart
+service neutron-dhcp-agent restart
+service neutron-metadata-agent restart
+service neutron-l3-agent restart
+
+neutron agent-list
+
+################################################################################
+##                                     dashboard                                ##
+################################################################################
+
+apt-get install -y openstack-dashboard
+
 apt-get remove -y --purge openstack-dashboard-ubuntu-theme
-sleep 5
 
-# Edit /etc/openstack-dashboard/local_settings.py:
-sed -e "
-/^ALLOWED_HOSTS =.*$/s/^.*$/ALLOWED_HOSTS = '*'/
-" -i /etc/openstack-dashboard/local_settings.py
+# vi /etc/openstack-dashboard/local_settings.py
+# OPENSTACK_HOST = "$ctrl_name"
+# ALLOWED_HOSTS = ['*', ]
+# OPENSTACK_KEYSTONE_DEFAULT_ROLE = "user"
 
-sed -e '
-/^OPENSTACK_HOST =.*$/s/^.*$/OPENSTACK_HOST = "'$ctrl_name'"/
-' -i /etc/openstack-dashboard/local_settings.py
-
-
-# Listen 5000
-# Listen 35357
-
-echo "
-<VirtualHost *:5000>
-    WSGIDaemonProcess keystone-public processes=5 threads=1 user=keystone group=keystone display-name=%{GROUP}
-    WSGIProcessGroup keystone-public
-    WSGIScriptAlias / /usr/bin/keystone-wsgi-public
-    WSGIApplicationGroup %{GLOBAL}
-    WSGIPassAuthorization On
-    <IfVersion >= 2.4>
-      ErrorLogFormat "%{cu}t %M"
-    </IfVersion>
-    ErrorLog /var/log/apache2/keystone.log
-    CustomLog /var/log/apache2/keystone_access.log combined
-
-    <Directory /usr/bin>
-        <IfVersion >= 2.4>
-            Require all granted
-        </IfVersion>
-        <IfVersion < 2.4>
-            Order allow,deny
-            Allow from all
-        </IfVersion>
-    </Directory>
-</VirtualHost>
-
-<VirtualHost *:35357>
-    WSGIDaemonProcess keystone-admin processes=5 threads=1 user=keystone group=keystone display-name=%{GROUP}
-    WSGIProcessGroup keystone-admin
-    WSGIScriptAlias / /usr/bin/keystone-wsgi-admin
-    WSGIApplicationGroup %{GLOBAL}
-    WSGIPassAuthorization On
-    <IfVersion >= 2.4>
-      ErrorLogFormat "%{cu}t %M"
-    </IfVersion>
-    ErrorLog /var/log/apache2/keystone.log
-    CustomLog /var/log/apache2/keystone_access.log combined
-
-    <Directory /usr/bin>
-        <IfVersion >= 2.4>
-            Require all granted
-        </IfVersion>
-        <IfVersion < 2.4>
-            Order allow,deny
-            Allow from all
-        </IfVersion>
-    </Directory>
-</VirtualHost>
-" > /etc/apache2/sites-available/wsgi-keystone.conf
-
-# Reload Apache and memcached:
-sudo ln -s /etc/apache2/sites-available/wsgi-keystone.conf /etc/apache2/sites-enabled
-service apache2 restart
-service memcached restart
-
-# Create internal network
-nova network-create private --bridge br100 --multi-host T  --dns1 8.8.8.8  --gateway 172.16.0.1 --fixed-range-v4 172.16.0.0/24
-sleep 4
-nova-manage floating create --pool=nova --ip_range=$extip
+service apache2 reload

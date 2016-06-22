@@ -52,139 +52,111 @@ Make sure you check that the 127.0.1.1 number is commented out of your /etc/host
 After you are done, do a 'ifdown --exclude=lo -a && sudo ifup --exclude=lo -a'.
 
 ###############################################################################################################"
-
-read -p "Make sure you have your rig name and networking configured properly before pressng ENTER to continue: "
-
 # grab our IP 
-read -p "Enter the device name for this rig's NIC (eth0, em1, etc.) : " rignic
-rigip=$(/sbin/ifconfig $rignic| sed -n 's/.*inet *addr:\([0-9\.]*\).*/\1/p')
+read -p "Enter the device name for Mine management NIC (eth0, etc.) : " rignic
+my_ip=$(/sbin/ifconfig $rignic| sed -n 's/.*inet *addr:\([0-9\.]*\).*/\1/p')
 
-# Grab our management interface name (the interface connected to the controller)
-read -p "Enter the device name for the rig's exernal NIC (eth1, p2p1, etc.) : " extnic
+read -p "Enter the device name for this rig's Data Plane NIC (eth0, etc.) : " datanic
 
-# Grab our controller's name (the one listed in the host file)
-read -p "Enter of the controller rig (controller, controller-01, etc.) : " ctrl_name
+read -p "Enter the device name for Controller rig's management NIC (eth0, etc.) : " rigip
 
-# Grab our compute's name (the one listed in the host file)
-read -p "Enter the name for this compute rig (compute1, compute-01, etc.) : " cmpt_name
+# Give your password
+read -p "Please enter a password for MySQL : " password
 
-# Give your password (the one given for MySQL on teh controller)
-read -p "Please enter the password for MySQL on the controller rig : " password
+#   backup source.list 
+#   add new sources
+mv /etc/apt/sources.list /etc/apt/sources.list.bak
+echo "deb http://ftp.tku.edu.tw/ubuntu/ trusty main restricted universe multiverse
+deb http://ftp.tku.edu.tw/ubuntu/ trusty-security main restricted universe multiverse
+deb http://ftp.tku.edu.tw/ubuntu/ trusty-updates main restricted universe multiverse
+deb http://ftp.tku.edu.tw/ubuntu/ trusty-proposed main restricted universe multiverse
+deb http://ftp.tku.edu.tw/ubuntu/ trusty-backports main restricted universe multiverse
+" >> /etc/apt/sources.list
 
-# Upgrade your rig
-apt-get update -y && apt-get upgrade -y && apt-get dist-upgrade -y
+sudo apt-key adv --keyserver keyserver.ubuntu.com --recv-keys 5EDB1B62EC4926EA
+sudo apt-get install -y software-properties-common
+#   add cloud sources liberty
+sudo add-apt-repository cloud-archive:liberty
+#   upgrade to the newest
+sudo apt-get update && apt-get dist-upgrade
+
+################################################################################
+##                                    NTP                                     ##
+################################################################################
 
 # Install Time Server
 apt-get install -y ntp
 
-# Check CPU
-apt-get install -y cpu-checker
-kvm-ok
+################################################################################
+##                                    OPENSTACK CLIENT                        ##
+################################################################################
+apt-get install python-openstackclient
 
-# Install and configure kvm:
-apt-get install -y kvm libvirt-bin pm-utils
+################################################################################
+##                                    nova                                ##
+################################################################################
+apt-get install nova-compute sysfsutils python-openstackclient python-novaclient
 
-# Install the Compute packages:
-apt-get install -y nova-compute-kvm python-guestfs
+ # vi /etc/nova/nova.conf
 
-# Make the current kernel readable:
-dpkg-statoverride  --update --add root root 0644 /boot/vmlinuz-$(uname -r)
-
-# make the kernel listen to us
-
-echo "
-#!/bin/sh
-version="$1"
-# passing the kernel version is required
-[ -z "${version}" ] && exit 0
-dpkg-statoverride --update --add root root 0644 /boot/vmlinuz-${version}
-" > /etc/kernel/postinst.d/statoverride
-
-# Install MySQL
-#apt-get install -y python-mysqldb
-
-# Install nova
-#apt-get install -y nova-compute-kvm
-
-# Edit the /etc/nova/nova.conf:
-echo "
 [DEFAULT]
-auth_strategy = keystone
-dhcpbridge_flagfile=/etc/nova/nova.conf
-dhcpbridge=/usr/bin/nova-dhcpbridge
-logdir=/var/log/nova
-state_path=/var/lib/nova
-lock_path=/var/lock/nova
-force_dhcp_release=True
-iscsi_helper=tgtadm
-libvirt_use_virtio_for_bridges=True
-connection_type=libvirt
-root_helper=sudo nova-rootwrap /etc/nova/rootwrap.conf
-verbose=True
-ec2_private_dns_show_ip=True
-api_paste_config=/etc/nova/api-paste.ini
-volumes_path=/var/lib/nova/volumes
-enabled_apis=ec2,osapi_compute,metadata
+iniset /etc/nova/nova.conf DEFAULT rpc_backend rabbit
+iniset /etc/nova/nova.conf DEFAULT auth_strategy keystone
+iniset /etc/nova/nova.conf DEFAULT my_ip $my_ip
+iniset /etc/nova/nova.conf DEFAULT network_api_class nova.network.neutronv2.api.API
+iniset /etc/nova/nova.conf DEFAULT linuxnet_interface_driver nova.network.linux_net.NeutronLinuxBridgeInterfaceDriver
+iniset /etc/nova/nova.conf DEFAULT firewall_driver nova.virt.firewall.NoopFirewallDriver
+iniset /etc/nova/nova.conf DEFAULT enabled_apis osapi_compute,metadata
 
-#RABBIT
-rpc_backend = rabbit
-rabbit_host = $ctrl_name
-rabbit_password = $password
+inicomment /etc/nova/nova.conf DEFAULT security_group_api
 
-#VNC
-my_ip = $rigip
-vnc_enabled = True
-vncserver_listen = 0.0.0.0
-vncserver_proxyclient_address = $rigip
-novncproxy_base_url = http://$ctrl_name:6080/vnc_auto.html
+iniset /etc/nova/nova.conf oslo_messagin_rabbit rabbit_host $rigip
+iniset /etc/nova/nova.conf oslo_messagin_rabbit rabbit_userid openstack
+iniset /etc/nova/nova.conf oslo_messagin_rabbit rabbit_password $password
 
-#GLANCE
-glance_host = $ctrl_name
+iniset /etc/nova/nova.conf keystone_authtoken auth_url  http://$rigip:35357
+iniset /etc/nova/nova.conf keystone_authtoken auth_plugin  password
+iniset /etc/nova/nova.conf keystone_authtoken project_domain_id  default
+iniset /etc/nova/nova.conf keystone_authtoken user_domain_id  default
+iniset /etc/nova/nova.conf keystone_authtoken project_name  service
+iniset /etc/nova/nova.conf keystone_authtoken username  nova
+iniset /etc/nova/nova.conf keystone_authtoken password  $password
 
-#NETWORKING
-network_api_class = nova.network.api.API
-security_group_api = nova
-firewall_driver = nova.virt.libvirt.firewall.IptablesFirewallDriver
-network_manager = nova.network.manager.FlatDHCPManager
-network_size = 254
-allow_same_net_traffic = False
-multi_host = True
-send_arp_for_ha = True
-share_dhcp_address = True
-force_dhcp_release = True
-flat_network_bridge = br100
-flat_interface = $rignic
-public_interface = $extnic
+iniset /etc/nova/nova.conf vnc enabled True
+iniset /etc/nova/nova.conf vnc vncserver_listen 0.0.0.0
+iniset /etc/nova/nova.conf vnc vncserver_proxyclient_address $rigip
+iniset /etc/nova/nova.conf vnc novncproxy_base_url http://172.18.47.111:6080/vnc_auto.html
+iniset /etc/nova/nova.conf glance host $rigip
+iniset /etc/nova/nova.conf oslo_concurrency lock_path /var/lib/nova/tmp
+ 
+# vi /etc/nova/nova.conf
+iniset /etc/nova/nova.conf neturon url http://$rigip:9696
+iniset /etc/nova/nova.conf neturon auth_url http://$rigip:35357
+iniset /etc/nova/nova.conf neturon auth_plugin password
+iniset /etc/nova/nova.conf neturon project_domain_id default
+iniset /etc/nova/nova.conf neturon user_domain_id default
+iniset /etc/nova/nova.conf neturon region_name RegionOne
+iniset /etc/nova/nova.conf neturon project_name service
+iniset /etc/nova/nova.conf neturon username neutron
+iniset /etc/nova/nova.conf neturon password $password
+iniset /etc/nova/nova.conf neturon service_metadata_proxy True
+iniset /etc/nova/nova.conf neturon metadata_proxy_shared_secret $password
 
-[database]
-connection = mysql+pymysql://nova:$password@$ctrl_name/nova
+# egrep -c '(vmx|svm)' /proc/cpuinfo
+# vi /etc/nova/nova-compute.conf
+# [libvirt]
+# virt_type = qemu // 如果支持硬件虚拟化，可以配置为kvm
 
-[keystone_authtoken]
-auth_uri = http://$ctrl_name:5000
-auth_host = $ctrl_name
-auth_port = 35357
-auth_protocol = http
-admin_tenant_name = service
-admin_user = nova
-admin_password = $password
-" > /etc/nova/nova.conf
+# 创建业务网络网桥
+ovs-vsctl add-br br-ex
+ovs-vsctl add-port br-ex $datanic
 
-# Remove Nova SQLite database:
-rm /var/lib/nova/nova.sqlite
+cat >> /etc/network/interfaces << EOF
+auto $datanic
+iface $datanic inet manual
+up ip link set dev $IFACE up
+down ip link set dev $IFACE down
+EOF
 
-# turn on forwarding
-echo 1 > /proc/sys/net/ipv4/ip_forward
-sudo sysctl net.ipv4.ip_forward=1
-
-#Install legacy networking components:
-apt-get install -y nova-network nova-api-metadata
-
-# Restart the Compute service:
 service nova-compute restart
-sleep 4
-service nova-network restart
-sleep 4
-service nova-api-metadata restart
-sleep 4
 
-nova-manage service list
